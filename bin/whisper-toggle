@@ -1,6 +1,6 @@
 #!/bin/bash
 # whisper-toggle — press once to record, press again to transcribe and paste
-# https://github.com/philcutter/whisper-toggle
+# https://github.com/zweck/whisper-toggle
 # License: MIT
 
 

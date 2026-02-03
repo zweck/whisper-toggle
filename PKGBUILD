@@ -1,10 +1,10 @@
-# Maintainer: Phil <phil@example.com>
+# Maintainer: zweck
 pkgname=whisper-toggle
 pkgver=1.0.0
 pkgrel=1
 pkgdesc="Single-keybinding speech-to-text for Linux — press once to record, press again to transcribe and paste"
 arch=('any')
-url="https://github.com/philcutter/whisper-toggle"
+url="https://github.com/zweck/whisper-toggle"
 license=('MIT')
 depends=(
     'bash'
@@ -23,11 +23,11 @@ optdepends=(
     'pciutils: GPU detection in setup wizard'
 )
 install=whisper-toggle.install
-source=()
-sha256sums=()
+source=("$pkgname-$pkgver.tar.gz::https://github.com/zweck/whisper-toggle/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
 
 package() {
-    cd "$startdir"
+    cd "$pkgname-$pkgver"
     install -Dm755 bin/whisper-toggle "$pkgdir/usr/bin/whisper-toggle"
     install -Dm755 bin/whisper-toggle-setup "$pkgdir/usr/bin/whisper-toggle-setup"
     install -Dm644 config/whisper-toggle.conf "$pkgdir/usr/share/whisper-toggle/whisper-toggle.conf"

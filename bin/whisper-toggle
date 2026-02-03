@@ -1,0 +1,280 @@
+#!/bin/bash
+# whisper-toggle — press once to record, press again to transcribe and paste
+# https://github.com/philcutter/whisper-toggle
+# License: MIT
+
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/whisper-toggle"
+CONF_FILE="$CONF_DIR/whisper-toggle.conf"
+LOCKFILE="/tmp/whisper-toggle.lock"
+LOGFILE="/tmp/whisper-toggle.log"
+DEBOUNCE_FILE="/tmp/whisper-toggle-debounce"
+AUDIO_FILE="/dev/shm/whisper-toggle.wav"
+
+# --- Defaults (overridden by config) ---
+BACKEND="server"
+WHISPER_MODEL="$HOME/.local/share/whisper-toggle/models/ggml-small.en.bin"
+WHISPER_PORT=58080
+WHISPER_DEVICE=0
+WHISPER_THREADS=4
+WHISPER_LANGUAGE="en"
+AUTOPASTE=1
+SILENCE_DURATION=3.0
+SILENCE_THRESHOLD=3
+WHISPER_SERVER=""
+WHISPER_CLI=""
+
+# --- Load config ---
+if [[ -f "$CONF_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONF_FILE"
+fi
+
+# --- Resolve binary paths ---
+find_binary() {
+    local name="$1"
+    local search_dirs=(
+        "$HOME/whisper.cpp/build/bin"
+        "$HOME/.local/bin"
+        "/usr/local/bin"
+        "/usr/bin"
+    )
+    command -v "$name" 2>/dev/null && return
+    for dir in "${search_dirs[@]}"; do
+        if [[ -x "$dir/$name" ]]; then
+            echo "$dir/$name"
+            return
+        fi
+    done
+}
+
+if [[ -z "$WHISPER_SERVER" ]]; then
+    WHISPER_SERVER="$(find_binary whisper-server)"
+fi
+if [[ -z "$WHISPER_CLI" ]]; then
+    WHISPER_CLI="$(find_binary whisper-cli)"
+fi
+
+# --- Session type detection ---
+SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"
+
+# --- Logging helper ---
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S'): $*" >> "$LOGFILE"
+}
+
+# --- Notification helper ---
+notify() {
+    local urgency="${2:-low}"
+    local icon="${3:-dialog-information}"
+    notify-send -t 1500 -u "$urgency" "Whisper Toggle" "$1" -i "$icon" 2>/dev/null || true
+}
+
+# --- Debounce (500ms) ---
+if [[ -f "$DEBOUNCE_FILE" ]]; then
+    last_call=$(cat "$DEBOUNCE_FILE" 2>/dev/null || echo 0)
+    now=$(date +%s%N)
+    diff=$(( (now - last_call) / 1000000 ))
+    if (( diff < 500 )); then
+        log "Debounced (${diff}ms)"
+        exit 0
+    fi
+fi
+date +%s%N > "$DEBOUNCE_FILE"
+
+# --- Clipboard helpers ---
+clip_copy() {
+    case "$SESSION_TYPE" in
+        wayland)
+            wl-copy "$1"
+            ;;
+        *)
+            echo -n "$1" | xsel -ib
+            ;;
+    esac
+}
+
+autopaste() {
+    if (( AUTOPASTE )); then
+        case "$SESSION_TYPE" in
+            wayland)
+                # ydotool keycodes: 37=LCtrl, 55=V (kernel keycodes)
+                ydotool key 37:1 55:1 55:0 37:0
+                ;;
+            *)
+                xdotool key ctrl+v
+                ;;
+        esac
+    fi
+}
+
+# --- Post-processing ---
+postprocess() {
+    local str="$1"
+    # Strip whisper non-speech markers like (wind blowing) or [BLANK_AUDIO]
+    str="${str//(*/}"
+    str="${str//[*/}"
+    # Trim leading whitespace and newlines
+    str="$(echo "$str" | sed 's/^[[:space:]]*//')"
+    # Capitalize first character
+    str="$(echo "$str" | sed 's/./\U&/')"
+    echo "$str"
+}
+
+# --- Transcribe via server backend ---
+transcribe_server() {
+    if [[ -z "$WHISPER_SERVER" ]]; then
+        notify "whisper-server not found" "critical" "dialog-error"
+        log "ERROR: whisper-server not found (set WHISPER_SERVER in config)"
+        exit 1
+    fi
+
+    # Start server in background — model loads while user speaks
+    local lang_flag=""
+    if [[ "$WHISPER_LANGUAGE" != "auto" ]]; then
+        lang_flag="-l $WHISPER_LANGUAGE"
+    fi
+    # Start in its own process group (setsid) so keypresses don't SIGINT it
+    # shellcheck disable=SC2086
+    setsid "$WHISPER_SERVER" \
+        -m "$WHISPER_MODEL" \
+        --port "$WHISPER_PORT" \
+        --device "$WHISPER_DEVICE" \
+        -t "$WHISPER_THREADS" \
+        $lang_flag \
+        >>"$LOGFILE" 2>&1 &
+    local server_pid=$!
+    log "Started whisper-server (PID $server_pid)"
+
+    # Record audio
+    notify "Recording..." "low" "microphone-sensitivity-high"
+    rec -q -t wav "$AUDIO_FILE" rate 16k \
+        silence 1 0.1 "${SILENCE_THRESHOLD}%" 1 "$SILENCE_DURATION" "${SILENCE_THRESHOLD}%" \
+        2>/dev/null || true
+
+    # Recording done — clear lock so second press won't interfere with transcription
+    rm -f "$LOCKFILE"
+    notify "Transcribing..." "low" "audio-x-generic"
+
+    # Wait for server to be ready (up to 30s)
+    local server_ready=0
+    for _ in $(seq 1 300); do
+        # Bail early if server process died
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            log "ERROR: whisper-server exited prematurely"
+            break
+        fi
+        if curl -s -f -o /dev/null "http://127.0.0.1:$WHISPER_PORT" 2>/dev/null; then
+            server_ready=1
+            break
+        fi
+        sleep 0.1
+    done
+
+    local str=""
+    if (( server_ready )); then
+        log "Server ready, sending inference request..."
+        # Transcribe
+        str=$(curl -S -s "http://127.0.0.1:$WHISPER_PORT/inference" \
+            -H "Content-Type: multipart/form-data" \
+            -F file="@$AUDIO_FILE" \
+            -F temperature="0.0" \
+            -F temperature_inc="0.2" \
+            -F response_format="text" 2>/dev/null) || true
+        log "Inference response: '$str'"
+    else
+        log "ERROR: whisper-server failed to start (check log above)"
+        notify "Server failed to start — check $LOGFILE" "critical" "dialog-error"
+    fi
+
+    # Kill server — pkill by port since setsid detaches from our process tree
+    kill "$server_pid" 2>/dev/null || true
+    # Also kill any whisper-server listening on our port, in case PID tracking lost it
+    pkill -f "whisper-server.*--port $WHISPER_PORT" 2>/dev/null || true
+
+    echo "$str"
+}
+
+# --- Transcribe via CLI backend ---
+transcribe_cli() {
+    if [[ -z "$WHISPER_CLI" ]]; then
+        notify "whisper-cli not found" "critical" "dialog-error"
+        log "ERROR: whisper-cli not found (set WHISPER_CLI in config)"
+        exit 1
+    fi
+
+    # Record audio
+    notify "Recording..." "low" "microphone-sensitivity-high"
+    rec -q -t wav "$AUDIO_FILE" rate 16k \
+        silence 1 0.1 "${SILENCE_THRESHOLD}%" 1 "$SILENCE_DURATION" "${SILENCE_THRESHOLD}%" \
+        2>/dev/null || true
+
+    # Recording done — clear lock so second press won't interfere with transcription
+    rm -f "$LOCKFILE"
+    notify "Transcribing..." "low" "audio-x-generic"
+
+    local lang_flag=""
+    if [[ "$WHISPER_LANGUAGE" != "auto" ]]; then
+        lang_flag="-l $WHISPER_LANGUAGE"
+    fi
+
+    local str
+    # shellcheck disable=SC2086
+    str=$("$WHISPER_CLI" \
+        -t "$WHISPER_THREADS" \
+        -nt \
+        --device "$WHISPER_DEVICE" \
+        -m "$WHISPER_MODEL" \
+        $lang_flag \
+        -f "$AUDIO_FILE" 2>/dev/null) || true
+
+    echo "$str"
+}
+
+# --- Main toggle logic ---
+log "Toggle called"
+
+if [[ -f "$LOCKFILE" ]]; then
+    # Second press: stop recording early
+    log "Stopping recording (lock exists)"
+    rm -f "$LOCKFILE"
+    pkill -x rec 2>/dev/null || true
+    # The first invocation's pipeline continues from where rec stopped
+else
+    # First press: start recording + transcription pipeline
+    log "Starting recording"
+    touch "$LOCKFILE"
+    rm -f "$AUDIO_FILE"
+
+    # Run transcription (lockfile removed as soon as recording ends)
+    raw=""
+    case "$BACKEND" in
+        server)
+            raw="$(transcribe_server)"
+            ;;
+        cli)
+            raw="$(transcribe_cli)"
+            ;;
+        *)
+            notify "Unknown backend: $BACKEND" "critical" "dialog-error"
+            rm -f "$LOCKFILE"
+            exit 1
+            ;;
+    esac
+
+    # Post-process
+    result="$(postprocess "$raw")"
+
+    if [[ -n "$result" ]]; then
+        clip_copy "$result"
+        autopaste
+        notify "$result" "low" "edit-paste"
+        log "Transcribed: $result"
+    else
+        notify "No speech detected" "low" "dialog-warning"
+        log "No speech detected"
+    fi
+
+    rm -f "$LOCKFILE"
+    log "Done"
+fi
